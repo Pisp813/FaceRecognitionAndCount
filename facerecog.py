@@ -4,15 +4,16 @@ import numpy as np
 import sqlite3
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView
+    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox
 )
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor
+
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 from sklearn.metrics.pairwise import cosine_similarity
 
-# ================== DATABASE (WITH EMBEDDING) ==================
+# ================== DATABASE ==================
 DB_NAME = 'faces.db'
 
 def init_db():
@@ -26,13 +27,18 @@ def init_db():
             embedding BLOB
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
 def save_person(pid, name, embedding):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Convert embedding to bytes
     emb_bytes = embedding.tobytes()
     cursor.execute('INSERT OR IGNORE INTO persons (id, name, count, embedding) VALUES (?, ?, 1, ?)',
                    (pid, name, emb_bytes))
@@ -55,14 +61,30 @@ def load_persons():
     persons = {}
     for row in rows:
         pid, name, count, emb_bytes = row
-        if emb_bytes:
-            embedding = np.frombuffer(emb_bytes, dtype=np.float32)
-        else:
-            embedding = None
+        embedding = np.frombuffer(emb_bytes, dtype=np.float32) if emb_bytes else None
         persons[pid] = [embedding, name, count]
     return persons
 
-# ================== MOBILENETV2 MODEL ==================
+def save_roi(x, y, w, h):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    roi_str = f"{x},{y},{w},{h}"
+    cursor.execute('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)', ('roi', roi_str))
+    conn.commit()
+    conn.close()
+
+def load_roi():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT value FROM config WHERE key = ?', ('roi',))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        x, y, w, h = map(int, row[0].split(','))
+        return (x, y, w, h)
+    return None
+
+# ================== MOBILENETV2 ==================
 print("Loading MobileNetV2...")
 model = MobileNetV2(weights='imagenet', include_top=False, pooling='avg', input_shape=(224, 224, 3))
 print("Model loaded.")
@@ -74,13 +96,14 @@ def get_embedding(face_img):
     x = np.expand_dims(x, axis=0)
     embedding = model.predict(x, verbose=0)
     embedding = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
-    return embedding.flatten()  # 1280-D
+    return embedding.flatten()
 
 # ================== SHARED DATA ==================
-init_db()  # Create DB first
-known_persons = load_persons()  # Load with embeddings
+init_db()
+known_persons = load_persons()
 next_id = max(known_persons.keys(), default=0) + 1
-SIMILARITY_THRESHOLD = 0.85
+SIMILARITY_THRESHOLD = 0.75
+detection_roi = load_roi()  # (x, y, w, h) or None
 
 # ================== CAMERA THREAD ==================
 class CameraThread(QThread):
@@ -94,22 +117,32 @@ class CameraThread(QThread):
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
     def run(self):
-        global known_persons, next_id
+        global known_persons, next_id, detection_roi
         while self._run_flag:
             ret, frame = self.cap.read()
             if not ret:
                 continue
+
+            # Draw ROI if set
+            if detection_roi:
+                x, y, w, h = detection_roi
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                cv2.putText(frame, "DETECTION ZONE", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = self.face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(100, 100))
 
             largest = None
             max_area = 0
-            for (x, y, w, h) in faces:
-                area = w * h
+            for (fx, fy, fw, fh) in faces:
+                if detection_roi:
+                    rx, ry, rw, rh = detection_roi
+                    if not (fx >= rx and fy >= ry and fx+fw <= rx+rw and fy+fh <= ry+rh):
+                        continue
+                area = fw * fh
                 if area > max_area:
                     max_area = area
-                    largest = (x, y, w, h)
+                    largest = (fx, fy, fw, fh)
 
             if largest:
                 x, y, w, h = largest
@@ -119,7 +152,6 @@ class CameraThread(QThread):
 
                 embedding = get_embedding(face)
 
-                # Find match
                 match_id = None
                 best_sim = 0
                 for pid, info in known_persons.items():
@@ -130,17 +162,15 @@ class CameraThread(QThread):
                             match_id = pid
 
                 if match_id and best_sim > SIMILARITY_THRESHOLD:
-                    # Known person
                     known_persons[match_id][2] += 1
                     update_count_db(match_id)
                     self.person_detected_signal.emit(match_id, known_persons[match_id][1], known_persons[match_id][2])
                     display_name = known_persons[match_id][1]
                 else:
-                    # New person
                     pid = next_id
                     name = f"Person {pid}"
                     known_persons[pid] = [embedding.copy(), name, 1]
-                    save_person(pid, name, embedding)  # Save embedding
+                    save_person(pid, name, embedding)
                     next_id += 1
                     self.person_detected_signal.emit(pid, name, 1)
                     display_name = name
@@ -157,12 +187,82 @@ class CameraThread(QThread):
         self._run_flag = False
         self.wait()
 
+# ================== ROI DRAWER (LIVE + IMMEDIATE UPDATE) ==================
+class ROIDrawer(QWidget):
+    def __init__(self, parent):
+        super().__init__()
+        self.setWindowTitle("Draw Detection Area (Click & Drag)")
+        self.setFixedSize(640, 480)
+        self.parent = parent
+        self.drawing = False
+        self.start_point = None
+        self.end_point = None
+        self.frame = None
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+        self.timer.start(30)  # 30ms = ~33 FPS
+
+    def update_frame(self):
+        if self.parent.thread and self.parent.thread.cap.isOpened():
+            ret, frame = self.parent.thread.cap.read()
+            if ret:
+                self.frame = frame.copy()
+                self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drawing = True
+            self.start_point = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if self.drawing:
+            self.end_point = event.pos()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.drawing:
+            self.drawing = False
+            self.end_point = event.pos()
+            x1, y1 = self.start_point.x(), self.start_point.y()
+            x2, y2 = self.end_point.x(), self.end_point.y()
+            x, y = min(x1, x2), min(y1, y2)
+            w, h = abs(x2 - x1), abs(y2 - y1)
+            if w > 50 and h > 50:
+                orig_w = self.parent.thread.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                orig_h = self.parent.thread.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                scale_x = orig_w / 640
+                scale_y = orig_h / 480
+                x, y, w, h = int(x * scale_x), int(y * scale_y), int(w * scale_x), int(h * scale_y)
+                save_roi(x, y, w, h)
+                global detection_roi
+                detection_roi = (x, y, w, h)  # IMMEDIATE UPDATE
+                self.parent.detection_roi = detection_roi
+                QMessageBox.information(self, "Success", f"Detection area updated: {x},{y},{w},{h}")
+            self.close()
+
+    def paintEvent(self, event):
+        if self.frame is not None:
+            painter = QPainter(self)
+            rgb = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            qt_img = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+            scaled = qt_img.scaled(640, 480, Qt.KeepAspectRatio)
+            painter.drawImage(0, 0, scaled)
+
+            if self.drawing and self.start_point and self.end_point:
+                x1, y1 = self.start_point.x(), self.start_point.y()
+                x2, y2 = self.end_point.x(), self.end_point.y()
+                painter.setPen(QColor(255, 0, 0, 255))
+                painter.setBrush(QColor(255, 0, 0, 50))
+                painter.drawRect(min(x1,x2), min(y1,y2), abs(x2-x1), abs(y2-y1))
+
 # ================== GUI ==================
 class FaceRecognitionGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Face Recognition (MobileNetV2 + Embedding in DB)")
+        self.setWindowTitle("Face Recognition + Live ROI")
         self.resize(1000, 700)
+        self.detection_roi = detection_roi
 
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
@@ -177,16 +277,27 @@ class FaceRecognitionGUI(QWidget):
         self.stop_btn = QPushButton("Stop Camera")
         self.stop_btn.clicked.connect(self.stop_camera)
         self.stop_btn.setEnabled(False)
+        self.roi_btn = QPushButton("Set Detection Area")
+        self.roi_btn.clicked.connect(self.set_roi)
 
         layout = QVBoxLayout()
         layout.addWidget(self.video_label)
         layout.addWidget(self.table)
         layout.addWidget(self.start_btn)
         layout.addWidget(self.stop_btn)
+        layout.addWidget(self.roi_btn)
         self.setLayout(layout)
 
         self.thread = None
+        self.drawer = None
         self.update_table()
+
+    def set_roi(self):
+        if not self.thread or not self.thread.cap.isOpened():
+            QMessageBox.warning(self, "Error", "Start camera first!")
+            return
+        self.drawer = ROIDrawer(self)
+        self.drawer.show()
 
     def start_camera(self):
         self.thread = CameraThread()
